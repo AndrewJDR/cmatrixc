@@ -218,12 +218,22 @@ Releases the resources acquired by `http_get` or `http_post`. Should be call whe
     #define HTTP_INVALID_SOCKET -1
 #endif
 
+#if 0
 #ifndef HTTP_MALLOC
     #define _CRT_NONSTDC_NO_DEPRECATE 
     #define _CRT_SECURE_NO_WARNINGS
     #include <stdlib.h>
     #define HTTP_MALLOC( ctx, size ) ( malloc( size ) )
     #define HTTP_FREE( ctx, ptr ) ( free( ptr ) )
+#endif
+#endif
+
+#ifdef USE_MBEDTLS
+#include "mbedtls/net.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/debug.h"
 #endif
 
 typedef struct http_internal_t 
@@ -246,16 +256,151 @@ typedef struct http_internal_t
     size_t data_size;
     size_t data_capacity;
     void* data;
+
+#ifdef USE_MBEDTLS
+    int useTls;
+    int handshake_pending;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+#endif
     } http_internal_t;
 
-
-static int http_internal_parse_url( char const* url, char* address, size_t address_capacity, char* port, 
-    size_t port_capacity, char const** resource )
+#ifdef USE_MBEDTLS
+    static void my_debug( void *ctx, int level,
+            const char *file, int line, const char *str )
     {
-    // make sure url starts with http://
-    if( strncmp( url, "http://", 7 ) != 0 ) return 0;
-    url += 7; // skip http:// part of url
-    
+        ((void) level);
+        fprintf( (FILE *) ctx, "%s:%04d: %s", file, line, str );
+        fflush(  (FILE *) ctx  );
+    }
+
+    int tls_send( void *ctx, const unsigned char *buf, size_t len )
+    {
+        if (ctx == 0)
+        {
+            return( MBEDTLS_ERR_NET_INVALID_CONTEXT );
+        }
+
+        HTTP_SOCKET sock = *((HTTP_SOCKET *)ctx);
+        int ret = send(sock, buf, (int) len, 0);
+
+        if(ret < 0)
+        {
+                if(errno == EAGAIN)
+                {
+                    return(MBEDTLS_ERR_SSL_WANT_WRITE);
+                }
+
+                return(MBEDTLS_ERR_NET_SEND_FAILED);
+        }
+
+        return(ret);
+    }
+
+    int tls_recv( void *ctx, unsigned char *buf, size_t len )
+    {
+        if (ctx == 0)
+        {
+            return( MBEDTLS_ERR_NET_INVALID_CONTEXT );
+        }
+
+        HTTP_SOCKET sock = *((HTTP_SOCKET *)ctx);
+        int ret = recv(sock, buf, len, 0 );
+        //int myerrno = errno;
+        //printf("theerrno: %d\n", errno);
+
+        if(ret < 0)
+        {
+            if(errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                //printf("returning WANT_READ\n");
+                return(MBEDTLS_ERR_SSL_WANT_READ);
+            }
+
+            //printf("returning RECV_FAILED\n");
+            return(MBEDTLS_ERR_NET_RECV_FAILED);
+        }
+
+        //printf("returning %d\n", ret);
+        return(ret);
+    }
+
+    int NET_RECV( http_internal_t *internal, unsigned char *buf, size_t len, int flags )
+    {
+        if (internal->useTls)
+        {
+            int ret = mbedtls_ssl_read(&internal->ssl, buf, len);
+
+            //printf("%.*s\n", (int)20, buf);
+
+            if (ret == MBEDTLS_ERR_SSL_WANT_READ)
+            {
+                errno = EAGAIN;
+            }
+
+            return ret;
+        }
+        else
+        {
+            return recv(internal->socket, buf, len, flags);
+        }
+    }
+
+    int NET_SEND( http_internal_t *internal, const void *buf, size_t len, int flags )
+    {
+        if (internal->useTls)
+        {
+            int ret = mbedtls_ssl_write(&internal->ssl, buf, len);
+            if (ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+            {
+                errno = EAGAIN;
+            }
+            return ret;
+        }
+        else
+        {
+            return send(internal->socket, buf, len, flags);
+        }
+    }
+#else
+    #define NET_RECV(httpt, buf, len, flags) recv(httpt->socket, buf, len, flags)
+    #define NET_SEND(httpt, buf, len, flags) send(httpt->socket, buf, len, flags)
+#endif
+
+#ifndef HTTP_MALLOC
+    #define _CRT_NONSTDC_NO_DEPRECATE
+    #define _CRT_SECURE_NO_WARNINGS
+    #include <stdlib.h>
+    #define HTTP_MALLOC( ctx, size ) ( malloc( size ) )
+    #define HTTP_FREE( ctx, ptr ) ( free( ptr ) )
+#endif
+
+
+
+static int http_internal_parse_url( char const* url, char* address, size_t address_capacity, char* port,
+    size_t port_capacity, int *useTls, char const** resource )
+    {
+
+    // make sure url starts with http:// or https://
+    if (strncmp( url, "http://", 7 ) == 0)
+    {
+        *useTls = 0;
+        url += 7;
+    }
+#ifdef USE_MBEDTLS
+    else if (strncmp( url, "https://", 8 ) == 0)
+    {
+        *useTls = 1;
+        url += 8;
+    }
+#endif
+    else
+    {
+        return 0;
+    }
+
     size_t url_len = strlen( url );
 
     // find end of address part of url
@@ -285,7 +430,7 @@ static int http_internal_parse_url( char const* url, char* address, size_t addre
         {
         // use default port number 80
         if( port_capacity <= 2 ) return 0;
-        strcpy( port, "80" );
+        strcpy( port, *useTls ? "443" : "80" );
         }
 
 
@@ -339,30 +484,29 @@ HTTP_SOCKET http_internal_connect( char const* address, char const* port )
 
     // connect to server
     if( connect( sock, addri->ai_addr, (int)addri->ai_addrlen ) == -1 )
+    {
+#ifdef _WIN32
+        if( WSAGetLastError() != WSAEWOULDBLOCK && WSAGetLastError() != WSAEINPROGRESS )
         {
-        #ifdef _WIN32
-            if( WSAGetLastError() != WSAEWOULDBLOCK && WSAGetLastError() != WSAEINPROGRESS )
-                {
-                freeaddrinfo( addri );
-                closesocket( sock );
-                return HTTP_INVALID_SOCKET;
-                }
-        #else
-            if( errno != EWOULDBLOCK && errno != EINPROGRESS && errno != EAGAIN )
-                {
-                freeaddrinfo( addri );
-                close( sock );
-                return HTTP_INVALID_SOCKET;
-                }
-        #endif
+            freeaddrinfo( addri );
+            closesocket( sock );
+            return HTTP_INVALID_SOCKET;
         }
+#else
+        if( errno != EWOULDBLOCK && errno != EINPROGRESS && errno != EAGAIN )
+        {
+            freeaddrinfo( addri );
+            close( sock );
+            return HTTP_INVALID_SOCKET;
+        }
+#endif
+    }
 
     freeaddrinfo( addri );
     return sock;
     }
 
-    
-static http_internal_t* http_internal_create( size_t request_data_size, void* memctx )
+static http_internal_t* http_internal_create( size_t request_data_size, void* memctx, int useTls )
     {
     http_internal_t* internal = (http_internal_t*) HTTP_MALLOC( memctx, sizeof( http_internal_t ) + request_data_size );
 
@@ -387,7 +531,46 @@ static http_internal_t* http_internal_create( size_t request_data_size, void* me
     
     internal->request_data = NULL;
     internal->request_data_size = 0;
-    
+
+#ifdef USE_MBEDTLS
+    internal->useTls = useTls;
+    internal->handshake_pending = 1;
+
+    if (internal->useTls)
+    {
+        const char *pers = "matrix_c_client";
+
+        mbedtls_ssl_init(&internal->ssl);
+        mbedtls_ssl_config_init(&internal->conf);
+        //mbedtls_x509_crt_init(&internal->cacert);
+        mbedtls_ctr_drbg_init(&internal->ctr_drbg);
+
+        mbedtls_entropy_init( &internal->entropy );
+        int ret;
+        if( ( ret = mbedtls_ctr_drbg_seed( &internal->ctr_drbg, mbedtls_entropy_func, &internal->entropy, pers, strlen(pers) ) ) != 0 )
+        {
+            printf( " failed\n  ! mbedtls_ctr_drbg_seed returned %d\n", ret );
+            return NULL;
+        }
+
+        if( ( ret = mbedtls_ssl_config_defaults( &internal->conf,
+                        MBEDTLS_SSL_IS_CLIENT,
+                        MBEDTLS_SSL_TRANSPORT_STREAM,
+                        MBEDTLS_SSL_PRESET_DEFAULT ) ) != 0 )
+        {
+            printf( " failed\n  ! mbedtls_ssl_config_defaults returned %d\n\n", ret );
+            return NULL;
+        }
+        mbedtls_ssl_conf_rng(&internal->conf, mbedtls_ctr_drbg_random, &internal->ctr_drbg);
+        //mbedtls_ssl_conf_dbg(&internal->conf, my_debug, stdout );
+        mbedtls_debug_set_threshold(1);
+        mbedtls_ssl_conf_authmode(&internal->conf, MBEDTLS_SSL_VERIFY_NONE);
+        //mbedtls_ssl_conf_ca_chain(&internal->conf, &cacert, NULL);
+
+        mbedtls_ssl_setup(&internal->ssl, &internal->conf);
+    }
+#endif
+
     return internal;
     }
 
@@ -402,17 +585,26 @@ http_t* http_get( char const* url, void* memctx )
     char address[ 256 ];
     char port[ 16 ];
     char const* resource;
-    
-    if( http_internal_parse_url( url, address, sizeof( address ), port, sizeof( port ), &resource ) == 0 )
-        return NULL; 
+    int useTls;
+
+    if( http_internal_parse_url( url, address, sizeof( address ), port, sizeof( port ), &useTls, &resource ) == 0 )
+        return NULL;
 
     HTTP_SOCKET socket = http_internal_connect( address, port );
     if( socket == HTTP_INVALID_SOCKET ) return NULL;
-    
-    http_internal_t* internal = http_internal_create( 0, memctx );
+
+    http_internal_t* internal = http_internal_create( 0, memctx, useTls );
     internal->socket = socket;
 
-    char* request_header;   
+#ifdef USE_MBEDTLS
+    if(useTls)
+    {
+        mbedtls_ssl_set_bio(&internal->ssl, (void*)&internal->socket, tls_send, tls_recv, NULL);
+        mbedtls_ssl_set_hostname(&internal->ssl, address);
+    }
+#endif
+
+    char* request_header;
     size_t request_header_len = 64 + strlen( resource ) + strlen( address ) + strlen( port );
     if( request_header_len < sizeof( internal->request_header ) )
         {
@@ -440,17 +632,26 @@ http_t* http_post( char const* url, void const* data, size_t size, void* memctx 
     char address[ 256 ];
     char port[ 16 ];
     char const* resource;
-    
-    if( http_internal_parse_url( url, address, sizeof( address ), port, sizeof( port ), &resource ) == 0 )
-        return NULL; 
+    int useTls;
+
+    if( http_internal_parse_url( url, address, sizeof( address ), port, sizeof( port ), &useTls, &resource ) == 0 )
+        return NULL;
 
     HTTP_SOCKET socket = http_internal_connect( address, port );
     if( socket == HTTP_INVALID_SOCKET ) return NULL;
-    
-    http_internal_t* internal = http_internal_create( size, memctx );
+
+    http_internal_t* internal = http_internal_create( size, memctx, useTls );
     internal->socket = socket;
 
-    char* request_header;   
+#ifdef USE_MBEDTLS
+    if(useTls)
+    {
+        mbedtls_ssl_set_bio(&internal->ssl, (void*)&internal->socket, tls_send, tls_recv, NULL);
+        mbedtls_ssl_set_hostname(&internal->ssl, address);
+    }
+#endif
+
+    char* request_header;
     size_t request_header_len = 64 + strlen( resource ) + strlen( address ) + strlen( port );
     if( request_header_len < sizeof( internal->request_header ) )
         {
@@ -489,29 +690,58 @@ http_status_t http_process( http_t* http )
         #pragma warning( pop )
         struct timeval timeout; timeout.tv_sec = 0; timeout.tv_usec = 0;
         // check if socket is ready for send
-        if( select( (int)( internal->socket + 1 ), NULL, &sockets_to_check, NULL, &timeout ) == 1 ) 
-            {
+        if( select( (int)( internal->socket + 1 ), NULL, &sockets_to_check, NULL, &timeout ) == 1 )
+        {
             int opt = -1;
-            socklen_t len = sizeof( opt ); 
-            if( getsockopt( internal->socket, SOL_SOCKET, SO_ERROR, (char*)( &opt ), &len) >= 0 && opt == 0 ) 
+            socklen_t len = sizeof( opt );
+            if( getsockopt( internal->socket, SOL_SOCKET, SO_ERROR, (char*)( &opt ), &len) >= 0 && opt == 0 )
+            {
                 internal->connect_pending = 0; // if it is, we're connected
             }
         }
+    }
 
     if( internal->connect_pending ) return http->status;
+
+#ifdef USE_MBEDTLS
+    if (internal->useTls && internal->handshake_pending)
+    {
+        int ret = mbedtls_ssl_handshake(&internal->ssl);
+        switch(ret)
+        {
+            case 0:
+            {
+                internal->handshake_pending = 0;
+            } break;
+
+            case MBEDTLS_ERR_SSL_WANT_READ:
+            case MBEDTLS_ERR_SSL_WANT_WRITE:
+            {
+                return http->status; // returns HTTP_STATUS_PENDING
+            } break;
+
+            default:
+            {
+                printf( " failed\n  ! mbedtls_ssl_handshake returned -0x%x\n\n", -ret );
+                http->status = HTTP_STATUS_FAILED;
+                return http->status;
+            }
+        }
+    }
+#endif
 
     if( !internal->request_sent )
         {
         char const* request_header = internal->request_header_large ? 
             internal->request_header_large : internal->request_header;
-        if( send( internal->socket, request_header, (int) strlen( request_header ), 0 ) == -1 )
+        if( NET_SEND( internal, request_header, (int) strlen( request_header ), 0 ) == -1 )
             {
             http->status = HTTP_STATUS_FAILED;
             return http->status;
             }
         if( internal->request_data_size )
             {
-            int res = send( internal->socket, (char const*)internal->request_data, (int) internal->request_data_size, 0 );
+            int res = NET_SEND( internal, (char const*)internal->request_data, (int) internal->request_data_size, 0 );
             if( res == -1 )
                 {
                 http->status = HTTP_STATUS_FAILED;
@@ -533,10 +763,18 @@ http_status_t http_process( http_t* http )
     while( select( (int)( internal->socket + 1 ), &sockets_to_check, NULL, NULL, &timeout ) == 1 )
         {
         char buffer[ 4096 ];
-        int size = recv( internal->socket, buffer, sizeof( buffer ), 0 );
-        if( size == -1 )
+        int size = NET_RECV( internal, buffer, sizeof( buffer ), 0 );
+        if( size < 0 )
             {
-            http->status = HTTP_STATUS_FAILED;
+                if(errno == EAGAIN)
+                {
+                    http->status = HTTP_STATUS_PENDING;
+                }
+                else
+                {
+                    http->status = HTTP_STATUS_FAILED;
+                    printf("failure: %x", size * -1);
+                }
             return http->status;
             }
         else if( size > 0 )
