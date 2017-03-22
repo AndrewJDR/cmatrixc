@@ -1,0 +1,5 @@
+*.o
+*.a
+test.sh
+matrixc_test
+*.swp
